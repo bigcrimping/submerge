@@ -48,11 +48,23 @@ const float HEIGHT_LIMIT_M = 30.0;
 const float PERIOD_MIN_S = 1.0;
 const float PERIOD_MAX_S = 30.0;
 
-// The API publishes a new observation every 30 minutes.
+// The API publishes a new observation every 30 minutes, and its terms ask
+// for requests no more often than that.
 const unsigned long FETCH_INTERVAL_MS = 30UL * 60UL * 1000UL;
-// After a failed fetch retry sooner: 1 minute, doubling on each further
-// failure up to the normal interval.
+// If the request itself fails (no WiFi, HTTP error) retry sooner: 1 minute,
+// doubling on each further failure up to the normal interval. A request that
+// succeeds but carries no usable reading just waits the normal interval.
 const unsigned long RETRY_INTERVAL_MS = 60UL * 1000UL;
+
+// A station that has stopped reporting keeps returning its last record, so
+// each record's timestamp is checked. Records older than this are ignored.
+const long MAX_RECORD_AGE_S = 3L * 60L * 60L;
+
+enum FetchResult {
+  FETCH_OK,        // new reading stored in lastGood
+  FETCH_FAILED,    // could not reach the API
+  FETCH_NO_DATA    // API answered, but with no usable or recent reading
+};
 
 // With no good observation for this long the wave stops and the tube holds a
 // steady low glow, so old data is not mistaken for live data.
@@ -352,13 +364,47 @@ float jsonNumber(JsonVariantConst v) {
   return 0.0f;
 }
 
+// Days since 1970-01-01 for a calendar date.
+long daysFromCivil(int y, int m, int d) {
+  y -= m <= 2;
+  long era = (y >= 0 ? y : y - 399) / 400;
+  long yoe = y - era * 400;
+  long doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  long doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097L + doe - 719468L;
+}
+
+int64_t toEpoch(int y, int mo, int d, int h, int mi, int s) {
+  return (int64_t)daysFromCivil(y, mo, d) * 86400 + h * 3600L + mi * 60 + s;
+}
+
+// Record timestamp from the API: "YYYYMMDD#hhmmss" in UTC.
+bool parseRecordDate(const char* s, int64_t& out) {
+  int y, mo, d, h, mi, sec;
+  if (!s || sscanf(s, "%4d%2d%2d#%2d%2d%2d", &y, &mo, &d, &h, &mi, &sec) != 6) return false;
+  out = toEpoch(y, mo, d, h, mi, sec);
+  return true;
+}
+
+// HTTP Date header: "Tue, 10 Nov 2026 09:45:00 GMT".
+bool parseHttpDate(const char* s, int64_t& out) {
+  char mon[4];
+  int d, y, h, mi, sec;
+  if (!s || sscanf(s, "%*3s, %d %3s %d %d:%d:%d", &d, mon, &y, &h, &mi, &sec) != 6) return false;
+  const char* names = "JanFebMarAprMayJunJulAugSepOctNovDec";
+  const char* p = strlen(mon) == 3 ? strstr(names, mon) : nullptr;
+  if (!p || (p - names) % 3 != 0) return false;
+  out = toEpoch(y, (p - names) / 3 + 1, d, h, mi, sec);
+  return true;
+}
+
 // Fetch the latest wave height / period from coastalmonitoring.org into
-// lastGood. Returns false on any failure, leaving lastGood unchanged.
-bool grab_data (){
+// lastGood. On anything but FETCH_OK, lastGood is left unchanged.
+FetchResult grab_data (){
 
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[WiFi] not connected, keeping last data");
-    return false;
+    return FETCH_FAILED;
   }
 
   std::unique_ptr<BearSSL::WiFiClientSecure>client(new BearSSL::WiFiClientSecure);
@@ -369,15 +415,19 @@ bool grab_data (){
   // "sensor=113" selects the buoy
   if (!https.begin(*client, "https://coastalmonitoring.org/observations/waves/latest.geojson?sensor=113&duration=0")) {
     Serial.printf("[HTTPS] Unable to connect\n");
-    return false;
+    return FETCH_FAILED;
   }
 
   https.addHeader("X-API-Key", cfg.key);
   https.addHeader("Referer", cfg.ref);
   https.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  // The server's own clock tells us the current time without needing NTP.
+  const char* wantedHeaders[] = { "Date" };
+  https.collectHeaders(wantedHeaders, 1);
 
   Serial.print("[HTTPS] GET...\n");
   int httpCode = https.GET();
+  String serverDate = https.header("Date");
   Serial.printf("Response code: %d\n", httpCode);
   Serial.printf("Content length: %d\n", https.getSize());
 
@@ -391,7 +441,7 @@ bool grab_data (){
       Serial.printf("[HTTPS] GET... failed, error: %s\n", https.errorToString(httpCode).c_str());
     }
     https.end();
-    return false;
+    return FETCH_FAILED;
   }
 
   String payload = https.getString();
@@ -403,10 +453,26 @@ bool grab_data (){
   if (error) {
     Serial.print("deserializeJson() failed: ");
     Serial.println(error.c_str());
-    return false;
+    return FETCH_FAILED;
   }
 
   JsonObjectConst features_0_properties = doc["features"][0]["properties"];
+
+  // How old is this record? Compare its timestamp with the server's clock.
+  int64_t recordTime, serverTime;
+  const char* recordDate = features_0_properties["date"];
+  if (parseRecordDate(recordDate, recordTime) && parseHttpDate(serverDate.c_str(), serverTime)) {
+    long ageS = (long)(serverTime - recordTime);
+    Serial.printf("Record is %ld min old\n", ageS / 60);
+    if (ageS > MAX_RECORD_AGE_S) {
+      Serial.println("Record is too old (station not reporting?), ignoring it");
+      dataStale = true;
+      return FETCH_NO_DATA;
+    }
+  } else {
+    Serial.println("Could not work out the record's age, accepting it");
+  }
+
   // The API sends numbers as strings ("11.100"), and hmax is often null, in
   // which case fall back to hs (significant wave height). Note hs is a
   // smaller quantity than hmax, so the display reads lower when this happens.
@@ -419,32 +485,38 @@ bool grab_data (){
 
   if (!(hmax > 0.0f) || !(tp > 0.0f)) {
     Serial.println("hmax/hs/tp missing or zero, keeping last data");
-    return false;
+    return FETCH_NO_DATA;
   }
   if (!(hmax <= HEIGHT_LIMIT_M) || !(tp >= PERIOD_MIN_S) || !(tp <= PERIOD_MAX_S)) {
     Serial.println("hmax/hs/tp outside plausible range, keeping last data");
-    return false;
+    return FETCH_NO_DATA;
   }
 
   lastGood.hmax = hmax;
   lastGood.tp = tp;
-  return true;
+  return FETCH_OK;
 }
 
 void loop() {
 
   // Refresh the observation every fetchInterval (and once at boot).
   if (!haveFetched || (millis() - lastFetchMillis) >= fetchInterval) {
-    bool ok = grab_data();
+    FetchResult result = grab_data();
     lastFetchMillis = millis();
     haveFetched = true;
 
-    if (ok) {
+    if (result == FETCH_OK) {
       haveGoodData = true;
       dataStale = false;
       lastGoodMillis = lastFetchMillis;
       fetchInterval = FETCH_INTERVAL_MS;
       retryInterval = RETRY_INTERVAL_MS;
+    } else if (result == FETCH_NO_DATA) {
+      // The API is fine, there is just nothing new: asking again sooner
+      // than the normal interval would not help.
+      fetchInterval = FETCH_INTERVAL_MS;
+      retryInterval = RETRY_INTERVAL_MS;
+      Serial.printf("No usable reading, checking again in %lu min\n", fetchInterval / 60000);
     } else {
       fetchInterval = retryInterval;
       retryInterval = min(retryInterval * 2, FETCH_INTERVAL_MS);

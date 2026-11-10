@@ -30,17 +30,19 @@ Whichever was changed most recently wins: values entered over serial override th
 
 ### How it works
 
-The routine "grab_data" requests the current wave height (hmax, falling back to hs when the buoy does not report hmax) and peak period (tp) from the API. The API requires setting two custom HTTP headers. Data is fetched every 30 minutes; a failed fetch is retried after 1 minute, backing off to 30 minutes.
+The routine "grab_data" requests the current wave height (hmax, falling back to hs when the buoy does not report hmax) and peak period (tp) from the API. The API requires setting two custom HTTP headers. Data is fetched every 30 minutes, matching how often the buoys report; if the request itself fails it is retried after 1 minute, backing off to 30 minutes.
+
+Each record's timestamp is checked against the server's clock, because a buoy that has stopped reporting keeps returning its last record. Records more than 3 hours old are ignored.
 
 The display routine converts the wave period into a delay between each of the 85 samples in "wave_array[]" and scales it via the wave height.
 
 The output full scale (PWM 255) is scaled to a max wave height of 6m which is a compromise between accuracy in extremely  high wave conditions and not looking boring at normal (0.8-1.2m) heights
 
-If no good reading has arrived for 3 hours the wave stops and the tube holds a steady low glow, so old data is not mistaken for live conditions.
+If the latest record is too old, or no good reading has arrived for 3 hours, the wave stops and the tube holds a steady low glow, so old data is not mistaken for live conditions.
 
 The API requests the following attribution:
 
-"Real time data displayed on this page are from the Regional Coastal Monitoring Programme, made freely available under the terms of the Open Government Licence. Please note that these are real-time data and are not quality-controlled."
+"Real time data displayed on this page are from the National Network of Regional Coastal Monitoring Programmes, made freely available under the terms of the Open Government Licence. Please note that data are not quality-controlled in real-time."
 
 ## Wiring
 
